@@ -1,0 +1,133 @@
+#FASTQ Quality Control reports from fastqs
+
+mkdir -p results/qc/fastqc
+fastqc fastq/*_1.fastq.gz fastq/*_2.fastq.gz -o results/qc/fastqc
+multiqc results/qc -o results/qc
+
+# Adapter and quality trimming > a fastp.html will be generated 
+fastp \
+  -i fastq/SRR098401_1.fastq.gz -I fastq/SRR098401_2.fastq.gz \
+  -o work/SRR098401_1.trim.fq.gz -O work/SRR098401_2.trim.fq.gz \
+  --detect_adapter_for_pe --thread 16 \
+  --html results/qc/SAMPLE.fastp.html --json results/qc/SAMPLE.fastp.json
+
+#Alignment to reference genome, previously neededa reference and indexed genome-> input trimmed fastqs outoput .bam. 
+#Align with BWA-MEM2 (or BWA-MEM) against GRCh38/hg38 (ALT-aware). Always set Read Group (RG) tags.
+
+bwa-mem2 index refs/GRCh38_full_analysis_set_plus_decoy_hla.fa
+
+
+RG='@RG\tID:SAMPLE\tSM:SAMPLE\tPL:ILLUMINA\tLB:LIB1\tPU:FLOWCELL.LANE'
+
+bwa-mem2 mem -t 16 refs/GRCh38_full_analysis_set_plus_decoy_hla.fa \
+
+work/SRR098401_1.trim.fq.gz work/SRR098401_2.trim.fq.gz \
+  | samtools view -b - \
+  | samtools sort -@ 8 -o work/SAMPLE.sorted.bam
+samtools index work/SAMPLE.sorted.bam
+
+#create reference files (DOWNLOADED exome.bedfrom Illumina site and made an intervallist, a dictionary (.dict) and a .fai
+gatk CreateSequenceDictionary \
+  -R refs/GRCh38_full_analysis_set_plus_decoy_hla.fa \
+  -O refs/GRCh38_full_analysis_set_plus_decoy_hla.dict
+
+gatk BedToIntervalList \
+  -I refs/hg38_Twist_Bioscience_for_Illumina_Exome_2_5.bed \
+  -O refs/hg38_Twist_Bioscience_for_Illumina_Exome_2_5.interval_list \
+  -SD refs/GRCh38_full_analysis_set_plus_decoy_hla.dict
+
+samtools faidx refs/GRCh38_full_analysis_set_plus_decoy_hla.fa
+
+#QC AFTER ALIGNMENT -> 
+#1.flagstat: Scans the bam and counts reads by SAM flag categories-> reads that passed QC,% of mapped reads, and properly mappedreads. output > .txt
+
+samtools flagstat work/SAMPLE.sorted.bam > results/qc/SAMPLE.flagstat.txt
+
+#2 collectmetrics evaluates how good the targeted sequence(wes) panel is
+
+gatk CollectHsMetrics \
+  -I work/SAMPLE.sorted.bam -O results/qc/SAMPLE.hs_metrics.txt \
+  -R refs/GRCh38_full_analysis_set_plus_decoy_hla.fa --BAIT_INTERVALS refs/hg38_Twist_Bioscience_for_Illumina_Exome_2_5.interval_list  \
+  --TARGET_INTERVALS refs/hg38_Twist_Bioscience_for_Illumina_Exome_2_5.interval_list
+
+# WGS metrics (NOT NECESSARY FOR WES)
+
+gatk CollectWgsMetrics \
+  -I work/SAMPLE.sorted.bam -O results/qc/SAMPLE.wgs_metrics.txt -R refs/GRCh38_full_analysis_set_plus_decoy_hla.fa
+
+
+#Duplicate marking & Base quality score recalibration(BQSR)
+
+gatk AddOrReplaceReadGroups \
+ -I work/SAMPLE.sorted.bam \
+ -O work/SAMPLE.sorted.RG.bam \
+ --RGID RG1 \
+  --RGLB LIB1 \
+  --RGPL ILLUMINA \
+  --RGPU FLOWCELL1.LANE1 \
+  --RGSM SAMPLE
+samtools index work/SAMPLE.sorted.RG.bam
+
+#gatk MarkDuplicatesSpark \
+  -I work/SAMPLE.sorted.RG.bam\
+  -O work/SAMPLE.dedup.bam \
+  -M results/qc/SAMPLE.dup_metrics.txt
+
+samtools index work/SAMPLE.dedup.bam
+tabix -p vcf refs/ALL_20141222.dbSNP142_human_GRCh38.snps.vcf.gz
+tabix -p vcf refs/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz
+
+#created a recalibration table based on reference files to then apply it to input 
+gatk BaseRecalibrator \
+  -I work/SAMPLE.dedup.bam -R refs/GRCh38_full_analysis_set_plus_decoy_hla.fa \
+  --known-sites refs/ALL_20141222.dbSNP142_human_GRCh38.snps.vcf.gz \
+  --known-sites refs/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz \
+  -O work/SAMPLE.recal_data.table
+
+gatk ApplyBQSR \
+  -I work/SAMPLE.dedup.bam -R refs/GRCh38_full_analysis_set_plus_decoy_hla.fa \
+ --bqsr-recal-file work/SAMPLE.recal_data.table \
+ --O work/SAMPLE.recal.bam
+
+
+samtools index work/SAMPLE.recal.bam  --verbosity INT
+
+#VARIANT CALLING-> one sample(one patient and one fastq)
+
+gatk HaplotypeCaller \
+  -R refs/GRCh38.fa -I work/SAMPLE.recal.bam \
+  -O results/gvcf/SAMPLE.g.vcf.gz -ERC GVCF
+
+
+
+#When having multiple samples-> joint genotyping with GenomicsDBImport (merges GVCFs from multiple samples and obtains a GenomicsDBWorkspace) and 
+#GenotypeGVCFs (performs joint genotyping pre-called with haplotypecaller for one or more samples
+
+gatk GenotypeGVCFs \
+  -R refs/GRCh38_full_analysis_set_plus_decoy_hla.fa \
+  -V results/gvcf/SAMPLE.g.vcf.gz \
+  -O results/vcf/cohort.unfiltered.vcf.gz
+
+
+#Variant Filtering -> Germline  ->Prefer VQSR for sufficiently large cohorts. Otherwise use hard filters.
+
+# SNPs (example thresholds)
+gatk VariantFiltration -V results/vcf/cohort.unfiltered.vcf.gz \
+  --filter-expression "QD < 2.0" --filter-name "QD2" \
+  -O results/vcf/cohort.hardfiltered.vcf.gz
+
+# INDELs (example thresholds)
+gatk VariantFiltration \
+  -V results/vcf/cohort.hardfiltered.vcf.gz \
+  --filter-expression "QD < 2.0" --filter-name "QD2" \
+  --filter-expression "FS > 200.0" --filter-name "FS200" \
+  --filter-expression "ReadPosRankSum < -20.0" --filter-name "RPRS-20" \
+  --filter-expression "SOR > 10.0" --filter-name "SOR10" \
+  -O results/vcf/cohort.filtered.vcf.gz
+
+#Annotation with VEP-ENSEMBL
+
+
+vep -i results/vcf/cohort.filtered.vcf.gz \
+    -o results/annotation/cohort.annotated.vcf \
+    --cache --everything --vcf --assembly GRCh38 --offline
