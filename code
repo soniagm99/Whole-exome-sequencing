@@ -111,23 +111,94 @@ gatk GenotypeGVCFs \
 
 #Variant Filtering -> Germline  ->Prefer VQSR for sufficiently large cohorts. Otherwise use hard filters.
 
+#small cohorts hard filtering
 # SNPs (example thresholds)
-gatk VariantFiltration -V results/vcf/cohort.unfiltered.vcf.gz \
+gatk SelectVariants \
+  -V results/vcf/cohort.unfiltered.vcf.gz \
+  --select-type-to-include SNP \
+  -O results/vcf/cohort.snps.vcf.gz
+
+gatk VariantFiltration \
+  -V results/vcf/cohort.snps.vcf.gz \
   --filter-expression "QD < 2.0" --filter-name "QD2" \
-  -O results/vcf/cohort.hardfiltered.vcf.gz
+  --filter-expression "FS > 60.0" --filter-name "FS60" \
+  --filter-expression "MQ < 40.0" --filter-name "MQ40" \
+  --filter-expression "MQRankSum < -12.5" --filter-name "MQRS-12.5" \
+  --filter-expression "ReadPosRankSum < -8.0" --filter-name "RPRS-8" \
+  --filter-expression "SOR > 3.0" --filter-name "SOR3" \
+  -O results/vcf/cohort.snps.hardfiltered.vcf.gz
 
 # INDELs (example thresholds)
+gatk SelectVariants \
+  -V results/vcf/cohort.unfiltered.vcf.gz \
+  --select-type-to-include INDEL \
+  -O results/vcf/cohort.indels.vcf.gz
+
+
+
+
 gatk VariantFiltration \
-  -V results/vcf/cohort.hardfiltered.vcf.gz \
+  -V results/vcf/cohort.indels.vcf.gz \
   --filter-expression "QD < 2.0" --filter-name "QD2" \
   --filter-expression "FS > 200.0" --filter-name "FS200" \
   --filter-expression "ReadPosRankSum < -20.0" --filter-name "RPRS-20" \
   --filter-expression "SOR > 10.0" --filter-name "SOR10" \
+  -O results/vcf/cohort.indels.filtered.vcf.gz
+
+gatk MergeVcfs \
+  -I results/vcf/cohort.snps.hardfiltered.vcf.gz \
+  -I results/vcf/cohort.indels.filtered.vcf.gz \
   -O results/vcf/cohort.filtered.vcf.gz
+
+#FILTER THE "PASS" variants with bash
 
 #Annotation with VEP-ENSEMBL
 
 
-vep -i results/vcf/cohort.filtered.vcf.gz \
-    -o results/annotation/cohort.annotated.vcf \
+
+vep -i results/vcf/cohort.pass.vcf.gz \
+    -o results/annotation/cohort.annotated_pass.vcf \
     --cache --everything --vcf --assembly GRCh38 --offline
+
+
+
+
+
+-----move to R in cluster and create a tidy table with variants
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(VariantAnnotation)
+vcf<- readVcf("cohort.annotated_pass.vcf")
+
+
+desc <- info(header(vcf))["CSQ", "Description"]
+format_string <- sub(".*Format: ", "", desc)
+csq_fields <- strsplit(format_string, "\\|")[[1]]
+csq_vec <- unlist(info(vcf)$CSQ)
+csq_df <- data.frame(CSQ = csq_vec) %>%
+  separate_rows(CSQ, sep = ",") %>%
+  separate(CSQ,
+           into = csq_fields,
+           sep = "\\|",
+           fill = "right",
+           extra = "merge")
+
+write.csv(csq_df, "csqvcf.csv")
+
+
+#filter and edit
+df<-read.csv("csqvcf.csv")
+
+df <- df %>%
+  mutate(
+    PolyPhen_pred = str_extract(PolyPhen, "^[^\\(]+"),
+    PolyPhen_score = as.numeric(str_extract(PolyPhen, "(?<=\\()[0-9\\.]+"))
+  )
+
+df_filt<- df %>%
+  filter(!PolyPhen_pred== "benign")
+df_filt<- df_filt %>%
+  filter(!PolyPhen_pred== "unknown")
+
